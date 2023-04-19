@@ -107,6 +107,38 @@ def parse_serialized_simulation_example(example_proto, metadata):
     return context, parsed_features
 
 
+def split_trajectory(context, features, window_length=7):
+    """Splits trajectory into sliding windows."""
+    # Our strategy is to make sure all the leading dimensions are the same size,
+    # then we can use from_tensor_slices.
+
+    trajectory_length = features['position'].get_shape().as_list()[0]
+
+    # We then stack window_length position changes so the final
+    # trajectory length will be - window_length +1 (the 1 to make sure we get
+    # the last split).
+    input_trajectory_length = trajectory_length - window_length + 1
+
+    model_input_features = {}
+    # Prepare the context features per step.
+    model_input_features['particle_type'] = tf.tile(
+        tf.expand_dims(context['particle_type'], axis=0),
+        [input_trajectory_length, 1])
+
+    if 'step_context' in features:
+        global_stack = []
+        for idx in range(input_trajectory_length):
+            global_stack.append(features['step_context'][idx:idx + window_length])
+        model_input_features['step_context'] = tf.stack(global_stack)
+
+    pos_stack = []
+    for idx in range(input_trajectory_length):
+        pos_stack.append(features['position'][idx:idx + window_length])
+    # Get the corresponding positions
+    model_input_features['position'] = tf.stack(pos_stack)
+
+    return tf.data.Dataset.from_tensor_slices(model_input_features)
+
 def read_metadata(data_path):
     with open(os.path.join(data_path, 'metadata.json'), 'rt') as fp:
         return json.loads(fp.read())
