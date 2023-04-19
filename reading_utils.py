@@ -18,6 +18,10 @@
 import functools
 import numpy as np
 import tensorflow.compat.v1 as tf
+import os
+import torch
+import functools
+import json
 
 # Create a description of the features.
 _FEATURE_DESCRIPTION = {
@@ -103,34 +107,97 @@ def parse_serialized_simulation_example(example_proto, metadata):
     return context, parsed_features
 
 
-def split_trajectory(context, features, window_length=7):
-    """Splits trajectory into sliding windows."""
-    # Our strategy is to make sure all the leading dimensions are the same size,
-    # then we can use from_tensor_slices.
+def read_metadata(data_path):
+    with open(os.path.join(data_path, 'metadata.json'), 'rt') as fp:
+        return json.loads(fp.read())
 
-    trajectory_length = features['position'].get_shape().as_list()[0]
-
-    # We then stack window_length position changes so the final
-    # trajectory length will be - window_length +1 (the 1 to make sure we get
-    # the last split).
-    input_trajectory_length = trajectory_length - window_length + 1
-
-    model_input_features = {}
-    # Prepare the context features per step.
-    model_input_features['particle_type'] = tf.tile(
-        tf.expand_dims(context['particle_type'], axis=0),
-        [input_trajectory_length, 1])
-
+def prepare_rollout_inputs(context, features):
+    """Prepares an inputs trajectory for rollout."""
+    out_dict = {**context}
+    # Position is encoded as [sequence_length, num_particles, dim] but the model
+    # expects [num_particles, sequence_length, dim].
+    pos = tf.transpose(features['position'], [1, 0, 2])
+    out_dict['position'] = pos
+    # Compute the number of nodes
+    out_dict['n_particles_per_example'] = [tf.shape(pos)[0]]
     if 'step_context' in features:
-        global_stack = []
-        for idx in range(input_trajectory_length):
-            global_stack.append(features['step_context'][idx:idx + window_length])
-        model_input_features['step_context'] = tf.stack(global_stack)
+        out_dict['step_context'] = features['step_context']
+    out_dict['is_trajectory'] = tf.constant([True], tf.bool)
+    return out_dict
 
-    pos_stack = []
-    for idx in range(input_trajectory_length):
-        pos_stack.append(features['position'][idx:idx + window_length])
-    # Get the corresponding positions
-    model_input_features['position'] = tf.stack(pos_stack)
+def tf2torch(data):
+    for key in data:
+        tensor = data[key]
+        numpy_arr = tensor.numpy()
+        if(isinstance(numpy_arr, np.ndarray)):
+            data[key] = torch.from_numpy(numpy_arr)
+    return data
 
-    return tf.data.Dataset.from_tensor_slices(model_input_features)
+def parse_data(path, metadata):
+    ds = tf.data.TFRecordDataset(path)
+    ds = ds.map(functools.partial(parse_serialized_simulation_example, metadata=metadata))
+    ds = ds.map(prepare_rollout_inputs)
+    parsed_data = []
+    for element in ds:
+        parsed_data.append(tf2torch(element))
+    return parsed_data
+
+def get_positions(parsed_data):
+    positions = [parsed_data[i]['position'] for i in np.arange(len(parsed_data))]
+    return positions
+
+def combine_positions(positions, all_pos=None):
+    for i in np.arange(len(positions)):
+        if all_pos is None:
+            all_pos = positions[i]
+        else: 
+            all_pos = torch.cat([all_pos, positions[i]])
+    return all_pos
+
+def update_dictionary_position(parsed_data, positions):
+    for i in np.arange(len(parsed_data)):
+        parsed_data[i]['position'] = positions[i]  
+    return 
+
+def half_trajectories(data_path, n=2):
+    metadata = read_metadata(data_path)
+    parsed_data_train = parse_data(data_path + "train.tfrecord", metadata)
+    parsed_data_test = parse_data(data_path + "test.tfrecord", metadata)
+    parsed_data_valid = parse_data(data_path + "valid.tfrecord", metadata)
+
+    positions_train = get_positions(parsed_data_train)
+    positions_test = get_positions(parsed_data_test)
+    positions_valid = get_positions(parsed_data_valid)
+
+    # take every-other position
+    positions_train = [position[:, ::n, :] for position in positions_train]
+    positions_test = [position[:, ::n, :] for position in positions_test]
+    positions_valid = [position[:, ::n, :] for position in positions_valid]
+
+    # update metadata statistics
+    all_pos = combine_positions(positions_train)
+    all_pos = combine_positions(positions_test, all_pos=all_pos)
+    all_pos = combine_positions(positions_valid, all_pos=all_pos)
+
+    velocity = torch.diff(all_pos, dim=1)
+    vel_mean = torch.mean(velocity, dim=[0,1])
+    vel_std = torch.std(velocity, dim=[0,1])
+
+    acceleration = torch.diff(velocity, dim=1)
+    acc_mean = torch.mean(acceleration, dim=[0,1])
+    acc_std = torch.std(acceleration, dim=[0,1])
+
+    # update dictionaries
+    metadata['dt'] = metadata['dt'] * n
+    metadata['vel_mean'] = vel_mean.tolist()
+    metadata['vel_std'] = vel_std.tolist()
+    metadata['acc_mean'] = acc_mean.tolist()
+    metadata['acc_std'] = acc_std.tolist()
+
+    metadata['sequence_length'] = positions_test[0].shape[1] - 1
+
+    update_dictionary_position(parsed_data_test, positions_test)
+    update_dictionary_position(parsed_data_train, positions_train)
+    update_dictionary_position(parsed_data_valid, positions_valid)
+
+    return metadata, parsed_data_train, parsed_data_test, parsed_data_valid

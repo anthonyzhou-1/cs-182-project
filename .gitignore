@@ -1,2 +1,4 @@
 # ignore all datasets
 temp/
+**/__pycache__
+**/Sand
